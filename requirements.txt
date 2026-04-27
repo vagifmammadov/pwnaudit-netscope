@@ -1,0 +1,3 @@
+PyQt6>=6.6
+scapy>=2.5
+psutil>=5.9
