@@ -247,6 +247,15 @@ class RulesPage(QWidget):
 
         toolbar.addStretch(1)
 
+        self.test_btn = QPushButton("⚡  Run self-test")
+        self.test_btn.setToolTip(
+            "Generate synthetic attack packets and feed them through the rule\n"
+            "engine — verifies the alert / toast / log pipeline without\n"
+            "needing a real attack on the wire."
+        )
+        self.test_btn.clicked.connect(self._on_self_test)
+        toolbar.addWidget(self.test_btn)
+
         self.clear_alerts_btn = QPushButton("Clear alerts")
         self.clear_alerts_btn.clicked.connect(self._on_clear_alerts)
         toolbar.addWidget(self.clear_alerts_btn)
@@ -424,6 +433,26 @@ class RulesPage(QWidget):
     def _on_clear_alerts(self) -> None:
         self._engine.clear_alerts()
         self.alerts_view.clear()
+
+    def _on_self_test(self) -> None:
+        """Trigger every built-in rule with synthetic packets so the user
+        can confirm the alert pipeline (toast + tray balloon + log) works.
+        """
+        self.test_btn.setEnabled(False)
+        try:
+            count = self._engine.run_self_test()
+        except Exception as exc:
+            QMessageBox.warning(self, "Self-test failed", str(exc))
+            return
+        finally:
+            self.test_btn.setEnabled(True)
+        QMessageBox.information(
+            self, "Self-test complete",
+            f"Fired {count} alert(s).  Check the toast notifications in the "
+            f"lower-right corner and the alert log below."
+            if count else
+            "No alerts fired — make sure the relevant rules are enabled.",
+        )
 
     def _refresh_alerts(self) -> None:
         # Render the entire alert log on a tick — simple and the deque is bounded.

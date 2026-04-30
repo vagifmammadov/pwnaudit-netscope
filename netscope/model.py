@@ -58,6 +58,10 @@ class PacketTableModel(QAbstractTableModel):
         self._raw.clear()
         self.endResetModel()
 
+    def all_raw(self) -> list[bytes]:
+        """Snapshot of every captured raw packet — used for PCAP export."""
+        return list(self._raw)
+
     def get_raw(self, row: int) -> Optional[bytes]:
         if 0 <= row < len(self._raw):
             return self._raw[row]

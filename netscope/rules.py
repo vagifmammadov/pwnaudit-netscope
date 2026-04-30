@@ -539,6 +539,52 @@ class RuleEngine:
             key = (rule.key_fn(pkt) if rule.key_fn else None) or "*"
             self._tick(rule, key, now, match)
 
+    # ── Self-test ──────────────────────────────────────────────────
+    def run_self_test(self) -> int:
+        """Synthesize fake packets that match every built-in rule and feed
+        them to ``observe()``.  Returns the number of alerts that fired.
+        Useful for verifying the toast / log pipeline without needing a
+        real attack on the wire.
+        """
+        try:
+            from scapy.all import IP, TCP, UDP, ICMP, ARP, Ether
+            from scapy.layers.dns import DNS, DNSQR
+        except ImportError:
+            return 0
+
+        before = len(self.alerts())
+
+        # Trip SYN flood + port scan (one source, many ports, SYN flag)
+        for port in range(1024, 1024 + 220):
+            pkt = IP(src="203.0.113.7", dst="198.51.100.10") / TCP(
+                sport=40000 + (port % 1000), dport=port, flags="S"
+            )
+            self.observe(pkt)
+
+        # Trip DNS flood
+        for i in range(90):
+            pkt = (
+                IP(src="203.0.113.7", dst="8.8.8.8")
+                / UDP(sport=50000 + i, dport=53)
+                / DNS(rd=1, qd=DNSQR(qname=f"test{i}.example.com"))
+            )
+            self.observe(pkt)
+
+        # Trip ICMP flood
+        for _ in range(220):
+            pkt = IP(src="203.0.113.7", dst="198.51.100.10") / ICMP(type=8)
+            self.observe(pkt)
+
+        # Trip ARP-spoof (many unsolicited replies from one MAC)
+        for i in range(25):
+            pkt = Ether(src="aa:bb:cc:dd:ee:ff") / ARP(
+                op=2, psrc="192.168.1.1", hwsrc="aa:bb:cc:dd:ee:ff",
+                pdst=f"192.168.1.{50 + i}", hwdst=f"00:11:22:33:44:{i:02x}",
+            )
+            self.observe(pkt)
+
+        return len(self.alerts()) - before
+
     # ── Internals ─────────────────────────────────────────────────
     def _tick(self, rule: Rule, key: str, now: float, details: dict[str, Any]) -> None:
         with self._lock:

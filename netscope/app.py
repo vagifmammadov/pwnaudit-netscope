@@ -10,8 +10,8 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QLineEdit, QTableView,
     QTreeWidget, QTreeWidgetItem, QSplitter, QToolBar,
-    QHeaderView, QPlainTextEdit, QMessageBox,
-    QFrame, QStackedWidget,
+    QHeaderView, QPlainTextEdit, QMessageBox, QFileDialog,
+    QFrame, QStackedWidget, QTabWidget,
 )
 
 from netscope.capture import CaptureEngine
@@ -38,6 +38,27 @@ def hex_dump(data: bytes) -> str:
         ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
         lines.append(f"{i:04x}   {hex_part}   {ascii_part}")
     return "\n".join(lines)
+
+
+def extract_strings(data: bytes, *, min_len: int = 4) -> str:
+    """Pull printable-ASCII runs of at least ``min_len`` chars out of a
+    packet — a quick way to skim HTTP headers, DNS names, TLS SNI, etc.
+    without manually decoding the hex dump.
+    """
+    if not data:
+        return ""
+    out: list[str] = []
+    current: list[int] = []
+    for b in data:
+        if 32 <= b < 127:
+            current.append(b)
+        else:
+            if len(current) >= min_len:
+                out.append(bytes(current).decode("ascii", errors="ignore"))
+            current = []
+    if len(current) >= min_len:
+        out.append(bytes(current).decode("ascii", errors="ignore"))
+    return "\n".join(out) if out else "(no printable strings ≥ 4 chars)"
 
 
 class CapturePage(QWidget):
@@ -104,6 +125,12 @@ class CapturePage(QWidget):
         self.iface_label.setStyleSheet(f"color: {ACCENT}; font-weight: 700; font-size: 13px;")
         tbl.addWidget(self.iface_label)
 
+        # Wi-Fi band badge — only visible when capture is on a Wi-Fi adapter.
+        # Set later in set_active().
+        self.band_badge = QLabel("")
+        self.band_badge.hide()
+        tbl.addWidget(self.band_badge)
+
         self.bpf_label = QLabel("")
         self.bpf_label.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px; font-family: Consolas, monospace;")
         tbl.addWidget(self.bpf_label)
@@ -141,6 +168,11 @@ class CapturePage(QWidget):
         self.clear_btn.clicked.connect(self._on_clear)
         tbl.addWidget(self.clear_btn)
 
+        self.export_btn = QPushButton("⬇  Export PCAP")
+        self.export_btn.setToolTip("Save captured packets to a Wireshark-compatible .pcap file")
+        self.export_btn.clicked.connect(self._on_export_pcap)
+        tbl.addWidget(self.export_btn)
+
         outer.addWidget(tb)
 
         # ── Tri-pane content ─────────────────────────────────────────────
@@ -177,9 +209,25 @@ class CapturePage(QWidget):
         self.hex_view.setFont(f)
         self.hex_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
 
+        # Printable-strings extraction — quick read of what a packet "says"
+        # without manually parsing the hex.  Tabs alongside the hex dump.
+        self.strings_view = QPlainTextEdit()
+        self.strings_view.setReadOnly(True)
+        self.strings_view.setFont(f)
+        self.strings_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+
+        right_tabs = QTabWidget()
+        right_tabs.addTab(self.hex_view, "Hex + ASCII")
+        right_tabs.addTab(self.strings_view, "Strings")
+        right_tabs.setStyleSheet(
+            f"QTabBar::tab {{ padding: 6px 14px; }}"
+            f"QTabBar::tab:selected {{ color: {ACCENT}; }}"
+        )
+        self._right_tabs = right_tabs
+
         bottom = QSplitter(Qt.Orientation.Horizontal)
         bottom.addWidget(self._panel("PROTOCOL TREE", self.detail_tree))
-        bottom.addWidget(self._panel("HEX DUMP", self.hex_view))
+        bottom.addWidget(self._panel("PAYLOAD", right_tabs))
         bottom.setSizes([580, 580])
 
         main_split = QSplitter(Qt.Orientation.Vertical)
@@ -229,11 +277,25 @@ class CapturePage(QWidget):
         return wrapper
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
-    def set_active(self, iface_label: str, bpf: str):
+    def set_active(self, iface_label: str, bpf: str, band_label: str = ""):
         self.iface_label.setText(iface_label)
         self.bpf_label.setText(f"  filter: {bpf}" if bpf else "")
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
+        # Highlight the band so the 5 GHz vs 2.4 GHz story is obvious in
+        # the screenshot / thesis report — the dominant signal a user sees.
+        if band_label:
+            badge_color = ACCENT if "5" in band_label else "#FBBF24" if "2.4" in band_label else TEXT_DIM
+            self.band_badge.setText(f"  {band_label}  ")
+            self.band_badge.setStyleSheet(
+                f"color: {badge_color}; background-color: {SURFACE_ALT}; "
+                f"border: 1px solid {badge_color}; border-radius: 10px; "
+                f"padding: 2px 10px; font-weight: 700; font-size: 10px; "
+                f"letter-spacing: 1.2px;"
+            )
+            self.band_badge.show()
+        else:
+            self.band_badge.hide()
         self.status_label.setText(f"●  Capturing on {iface_label}")
         self.status_label.setStyleSheet(f"color: {ACCENT}; font-size: 11px; font-weight: 600;")
         self.display_filter.clear()
@@ -279,6 +341,46 @@ class CapturePage(QWidget):
         self.model.clear()
         self.detail_tree.clear()
         self.hex_view.clear()
+        self.strings_view.clear()
+
+    def _on_export_pcap(self):
+        """Save every captured packet to a Wireshark-compatible .pcap file."""
+        raws = self.model.all_raw()
+        if not raws:
+            QMessageBox.information(
+                self, "Nothing to export",
+                "No packets have been captured yet.",
+            )
+            return
+        from datetime import datetime
+        default_name = f"pwnaudit-capture-{datetime.now().strftime('%Y%m%d-%H%M%S')}.pcap"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export capture as PCAP",
+            default_name,
+            "PCAP files (*.pcap);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            from scapy.all import Ether, wrpcap
+            packets = []
+            for raw in raws:
+                try:
+                    packets.append(Ether(raw))
+                except Exception:
+                    # Fallback: scapy can wrap raw bytes if Ethernet decode fails
+                    from scapy.all import Raw
+                    packets.append(Raw(raw))
+            wrpcap(path, packets)
+        except Exception as exc:
+            QMessageBox.critical(self, "Export failed", f"Could not write PCAP:\n\n{exc}")
+            return
+        QMessageBox.information(
+            self, "Export complete",
+            f"Saved {len(raws):,} packets to:\n{path}\n\n"
+            f"Open with Wireshark or any pcap-compatible tool.",
+        )
 
     def _drain(self):
         items = self.engine.drain()
@@ -317,6 +419,7 @@ class CapturePage(QWidget):
             return
         self.detail_tree.clear()
         self.hex_view.setPlainText(hex_dump(raw))
+        self.strings_view.setPlainText(extract_strings(raw))
         try:
             from scapy.all import Ether
             pkt = Ether(raw)
@@ -571,9 +674,20 @@ class MainWindow(QMainWindow):
                 f"  • The BPF filter has a syntax error"
             )
             return
+        # Resolve Wi-Fi band once at capture start — packets captured during
+        # this session are associated with this band.  Quick (~10ms cached
+        # by netsh).
+        band_label = ""
+        try:
+            from netscope.wifi import current_wifi_for
+            adapter = current_wifi_for(psutil_name)
+            if adapter and adapter.band_label:
+                band_label = adapter.band_label
+        except Exception:
+            band_label = ""
         self.welcome.stop_monitoring()
         self.wireless.stop_monitoring()
-        self.capture_page.set_active(psutil_name, bpf)
+        self.capture_page.set_active(psutil_name, bpf, band_label)
         self.stack.setCurrentWidget(self.capture_page)
 
     def _on_back(self):

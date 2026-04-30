@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame,
@@ -43,6 +43,25 @@ def _band_color(band_label: str) -> str:
     if "6" in band_label:
         return INFO
     return TEXT_DIM
+
+
+class _WifiScanWorker(QThread):
+    """Run blocking ``netsh`` calls on a worker thread so the UI stays
+    responsive.  Emits the parsed result on success or empty lists on error.
+    """
+
+    result = pyqtSignal(list, list)
+
+    def run(self) -> None:
+        try:
+            adapters = list_wifi_adapters()
+        except Exception:
+            adapters = []
+        try:
+            nets = list_visible_networks()
+        except Exception:
+            nets = []
+        self.result.emit(adapters, nets)
 
 
 def _signal_bars(pct: Optional[int]) -> str:
@@ -166,6 +185,7 @@ class WirelessPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._adapter: Optional[WifiAdapter] = None
+        self._scan_worker: Optional[_WifiScanWorker] = None
         self._build_ui()
 
         self._refresh_timer = QTimer(self)
@@ -302,10 +322,28 @@ class WirelessPage(QWidget):
 
     def stop_monitoring(self) -> None:
         self._refresh_timer.stop()
+        # Let any in-flight worker finish on its own thread; just stop
+        # listening for its result.
+        if self._scan_worker is not None and self._scan_worker.isRunning():
+            try:
+                self._scan_worker.result.disconnect()
+            except (TypeError, RuntimeError):
+                pass
 
     # ── Data loading ──────────────────────────────────────────────────
     def refresh(self) -> None:
-        adapters = list_wifi_adapters()
+        # Don't pile up scans if the previous one is still running (netsh
+        # can take 1-3 seconds — without this guard a slow box would
+        # accumulate workers).
+        if self._scan_worker is not None and self._scan_worker.isRunning():
+            return
+        worker = _WifiScanWorker(self)
+        worker.result.connect(self._on_scan_complete)
+        worker.finished.connect(worker.deleteLater)
+        self._scan_worker = worker
+        worker.start()
+
+    def _on_scan_complete(self, adapters: list, nets: list) -> None:
         previous = self.adapter_combo.currentText()
         self.adapter_combo.blockSignals(True)
         self.adapter_combo.clear()
@@ -326,7 +364,7 @@ class WirelessPage(QWidget):
         idx = self.adapter_combo.currentIndex()
         self._adapter = self.adapter_combo.itemData(idx) if idx >= 0 else None
         self._render_adapter()
-        self._cache_networks = list_visible_networks()
+        self._cache_networks = nets
         self._render_networks()
 
     def _on_adapter_changed(self, idx: int) -> None:
