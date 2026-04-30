@@ -17,8 +17,13 @@ from PyQt6.QtWidgets import (
 from netscope.capture import CaptureEngine
 from netscope.model import PacketTableModel, DisplayFilterProxy
 from netscope.dissect import packet_layers
-from netscope.theme import ACCENT, BORDER, SURFACE, TEXT, TEXT_DIM
+from netscope.theme import ACCENT, ACCENT_DEEP, BG, BORDER, SURFACE, SURFACE_ALT, TEXT, TEXT_DIM
 from netscope.welcome import WelcomePage
+from netscope.wireless_page import WirelessPage
+from netscope.rules import RuleEngine, Alert
+from netscope.rules_page import RulesPage
+from netscope.notify import NotificationCenter
+from netscope.pentest_page import PentestPage
 
 
 def hex_dump(data: bytes) -> str:
@@ -328,6 +333,40 @@ class CapturePage(QWidget):
         self.detail_tree.expandToDepth(0)
 
 
+class SidebarButton(QPushButton):
+    """Left-rail nav button with active / inactive states."""
+
+    def __init__(self, glyph: str, label: str, parent=None):
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setText(f"  {glyph}   {label}")
+        self.setStyleSheet(self._qss(active=False))
+
+    def setActive(self, active: bool) -> None:
+        self.setChecked(active)
+        self.setStyleSheet(self._qss(active=active))
+
+    @staticmethod
+    def _qss(*, active: bool) -> str:
+        if active:
+            bg = ACCENT
+            fg = ACCENT_DEEP
+            border = ACCENT
+        else:
+            bg = "transparent"
+            fg = TEXT
+            border = "transparent"
+        return (
+            f"QPushButton {{ background-color: {bg}; color: {fg}; "
+            f"border: 1px solid {border}; border-radius: 6px; "
+            f"padding: 10px 14px; text-align: left; font-weight: 700; "
+            f"font-size: 12px; letter-spacing: 0.4px; }}"
+            f"QPushButton:hover {{ background-color: {SURFACE_ALT}; "
+            f"border-color: {BORDER}; color: {ACCENT}; }}"
+        )
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -339,20 +378,101 @@ class MainWindow(QMainWindow):
         self.proxy = DisplayFilterProxy(self)
         self.proxy.setSourceModel(self.model)
 
+        # Rules engine — observes every packet from the capture engine and
+        # fires alerts.  We hand the observer to CaptureEngine so the rule
+        # check happens on the sniffer thread, off the UI loop.
+        self.rule_engine = RuleEngine()
+        self.engine.set_observer(self.rule_engine.observe)
+
         self._setup_brand_titlebar()
 
+        # In-window toast / tray notification center.
+        self.notifications = NotificationCenter(self)
+        self.rule_engine.add_listener(self._on_rule_alert)
+
+        # ── Pages ────────────────────────────────────────────────────
         self.welcome = WelcomePage(self)
         self.welcome.interface_chosen.connect(self._on_interface_chosen)
+
+        self.wireless = WirelessPage(self)
+        self.wireless.capture_requested.connect(self._on_interface_chosen)
+
+        self.rules_page = RulesPage(self.rule_engine, self)
+        self.pentest_page = PentestPage(self)
 
         self.capture_page = CapturePage(self.engine, self.model, self.proxy, self)
         self.capture_page.back_requested.connect(self._on_back)
 
+        # ── Sidebar + content layout ────────────────────────────────
         self.stack = QStackedWidget()
-        self.stack.addWidget(self.welcome)
-        self.stack.addWidget(self.capture_page)
-        self.setCentralWidget(self.stack)
+        self.stack.addWidget(self.welcome)        # 0
+        self.stack.addWidget(self.wireless)       # 1
+        self.stack.addWidget(self.rules_page)     # 2
+        self.stack.addWidget(self.pentest_page)   # 3
+        self.stack.addWidget(self.capture_page)   # 4
 
-        self.welcome.start_monitoring()
+        sidebar = self._build_sidebar()
+
+        root = QWidget()
+        root_layout = QHBoxLayout(root)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+        root_layout.addWidget(sidebar)
+        root_layout.addWidget(self.stack, 1)
+        self.setCentralWidget(root)
+
+        self._previous_page: int = 0
+        self._show_welcome()
+
+    # ── Sidebar build ─────────────────────────────────────────────────
+    def _build_sidebar(self) -> QWidget:
+        bar = QFrame()
+        bar.setFixedWidth(196)
+        bar.setStyleSheet(
+            f"QFrame {{ background-color: {SURFACE}; "
+            f"border-right: 1px solid {BORDER}; }}"
+        )
+        layout = QVBoxLayout(bar)
+        layout.setContentsMargins(12, 16, 12, 16)
+        layout.setSpacing(6)
+
+        nav_label = QLabel("NAVIGATION")
+        nav_label.setStyleSheet(
+            f"color: {TEXT_DIM}; font-size: 9px; letter-spacing: 1.5px; "
+            f"font-weight: 700; padding: 0 6px 8px 6px;"
+        )
+        layout.addWidget(nav_label)
+
+        self.btn_welcome = SidebarButton("⊟", "Interfaces")
+        self.btn_welcome.clicked.connect(self._show_welcome)
+        layout.addWidget(self.btn_welcome)
+
+        self.btn_wireless = SidebarButton("⌬", "Wireless")
+        self.btn_wireless.clicked.connect(self._show_wireless)
+        layout.addWidget(self.btn_wireless)
+
+        self.btn_rules = SidebarButton("△", "Rules")
+        self.btn_rules.clicked.connect(self._show_rules)
+        layout.addWidget(self.btn_rules)
+
+        self.btn_pentest = SidebarButton("◇", "Pentest")
+        self.btn_pentest.clicked.connect(self._show_pentest)
+        layout.addWidget(self.btn_pentest)
+
+        layout.addStretch(1)
+
+        # Authorisation reminder at the bottom of the rail.
+        notice = QLabel(
+            "All capture and pentest actions stay on this device.\n"
+            "Use only on networks you own or are authorised to test."
+        )
+        notice.setWordWrap(True)
+        notice.setStyleSheet(
+            f"color: {TEXT_DIM}; font-size: 10px; padding: 8px 6px; "
+            f"border-top: 1px solid {BORDER};"
+        )
+        layout.addWidget(notice)
+        return bar
 
     def _setup_brand_titlebar(self):
         tb = QToolBar()
@@ -376,6 +496,67 @@ class MainWindow(QMainWindow):
         )
         tb.addWidget(sub)
 
+    # ── Navigation ────────────────────────────────────────────────────
+    def _set_active_button(self, active: str) -> None:
+        for name, btn in {
+            "welcome": self.btn_welcome,
+            "wireless": self.btn_wireless,
+            "rules": self.btn_rules,
+            "pentest": self.btn_pentest,
+        }.items():
+            if btn is not None:
+                btn.setActive(name == active)
+
+    def _show_welcome(self) -> None:
+        if self.engine.is_running():
+            return  # don't tear down active capture mid-click
+        self.wireless.stop_monitoring()
+        self.welcome.start_monitoring()
+        self.stack.setCurrentWidget(self.welcome)
+        self._set_active_button("welcome")
+        self._previous_page = 0
+
+    def _show_wireless(self) -> None:
+        if self.engine.is_running():
+            return
+        self.welcome.stop_monitoring()
+        self.rules_page.stop_monitoring()
+        self.wireless.start_monitoring()
+        self.stack.setCurrentWidget(self.wireless)
+        self._set_active_button("wireless")
+        self._previous_page = 1
+
+    def _show_rules(self) -> None:
+        # Rules tab is safe to switch to even mid-capture — it's read-only
+        # against the alert log, and disabling rules has no effect on capture.
+        self.welcome.stop_monitoring()
+        self.wireless.stop_monitoring()
+        self.rules_page.start_monitoring()
+        self.stack.setCurrentWidget(self.rules_page)
+        self._set_active_button("rules")
+        self._previous_page = 2
+
+    def _show_pentest(self) -> None:
+        self.welcome.stop_monitoring()
+        self.wireless.stop_monitoring()
+        self.rules_page.stop_monitoring()
+        self.stack.setCurrentWidget(self.pentest_page)
+        self._set_active_button("pentest")
+        self._previous_page = 3
+
+    def _on_rule_alert(self, alert: Alert) -> None:
+        """Rule engine listener — runs on the sniffer thread.  Dispatches the
+        toast onto the UI thread via QTimer.singleShot(0, ...)."""
+        QTimer.singleShot(
+            0,
+            lambda a=alert: self.notifications.show(
+                title=a.title,
+                message=a.message,
+                severity=a.severity,
+            ),
+        )
+
+    # ── Capture launch / teardown ────────────────────────────────────
     def _on_interface_chosen(self, psutil_name: str, scapy_name: str, bpf: str):
         try:
             self.engine.start(scapy_name, bpf)
@@ -391,6 +572,7 @@ class MainWindow(QMainWindow):
             )
             return
         self.welcome.stop_monitoring()
+        self.wireless.stop_monitoring()
         self.capture_page.set_active(psutil_name, bpf)
         self.stack.setCurrentWidget(self.capture_page)
 
@@ -401,13 +583,28 @@ class MainWindow(QMainWindow):
             pass
         self.capture_page.deactivate()
         self.model.clear()
-        self.welcome.start_monitoring()
-        self.stack.setCurrentWidget(self.welcome)
+        if self._previous_page == 1:
+            self._show_wireless()
+        elif self._previous_page == 2:
+            self._show_rules()
+        else:
+            self._show_welcome()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Keep toasts pinned to the lower-right corner on resize.
+        try:
+            self.notifications._reflow()
+        except Exception:
+            pass
 
     def closeEvent(self, event):
         try:
             self.engine.stop()
             self.welcome.stop_monitoring()
+            self.wireless.stop_monitoring()
+            self.rules_page.stop_monitoring()
+            self.pentest_page.stop_all()
             self.capture_page.deactivate()
         except Exception:
             pass

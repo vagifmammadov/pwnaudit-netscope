@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from scapy.all import AsyncSniffer, get_if_list
 
@@ -14,6 +14,9 @@ class CaptureEngine:
     """
     Captures packets in a background thread (scapy's AsyncSniffer) and stores
     them in an in-memory buffer that the UI thread drains every ~100ms.
+
+    Optionally invokes ``packet_observer(pkt)`` for every captured packet —
+    used by the rules engine to evaluate detection rules in real time.
     """
 
     def __init__(self) -> None:
@@ -24,6 +27,12 @@ class CaptureEngine:
         self._start_time: Optional[float] = None
         self._iface: str = ""
         self._bpf: str = ""
+        self._observer: Optional[Callable[[Any], None]] = None
+
+    def set_observer(self, observer: Optional[Callable[[Any], None]]) -> None:
+        """Install a per-packet observer (e.g. RuleEngine.observe).  Set to
+        ``None`` to remove.  Observer is called from the sniffer thread."""
+        self._observer = observer
 
     def is_running(self) -> bool:
         return self._sniffer is not None
@@ -47,6 +56,12 @@ class CaptureEngine:
                 return
             with self._lock:
                 self._buffer.append((row, raw))
+            obs = self._observer
+            if obs is not None:
+                try:
+                    obs(pkt)
+                except Exception:
+                    pass
 
         kwargs: dict[str, Any] = {"prn": on_packet, "store": False, "iface": iface}
         if bpf_filter and bpf_filter.strip():
