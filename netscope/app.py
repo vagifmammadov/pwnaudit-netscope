@@ -142,8 +142,22 @@ class CapturePage(QWidget):
         tbl.addWidget(df_label)
 
         self.display_filter = QLineEdit()
-        self.display_filter.setPlaceholderText("substring · ip · port · proto")
-        self.display_filter.setMinimumWidth(240)
+        self.display_filter.setPlaceholderText(
+            "tcp.port == 443 && http.host contains \"google\"  ·  ip.addr == 10.0.0.0/24  ·  dns"
+        )
+        self.display_filter.setMinimumWidth(360)
+        self.display_filter.setToolTip(
+            "Wireshark-style display filter.\n\n"
+            "Examples:\n"
+            "  tcp.port == 443\n"
+            "  ip.addr == 192.168.1.0/24\n"
+            "  dns.qry.name contains \"google\"\n"
+            "  tls.handshake.type == 1\n"
+            "  http.response.code >= 400\n"
+            "  tcp.port in {80, 443, 8080}\n"
+            "  not (ip.src == 10.0.0.1)\n\n"
+            "Anything that doesn't parse falls back to substring search."
+        )
         self.display_filter.textChanged.connect(self._on_display_filter_changed)
         tbl.addWidget(self.display_filter)
 
@@ -167,6 +181,11 @@ class CapturePage(QWidget):
         self.clear_btn = QPushButton("Clear")
         self.clear_btn.clicked.connect(self._on_clear)
         tbl.addWidget(self.clear_btn)
+
+        self.open_btn = QPushButton("⬆  Open PCAP")
+        self.open_btn.setToolTip("Load a Wireshark .pcap or .pcapng file into the table")
+        self.open_btn.clicked.connect(self._on_open_pcap)
+        tbl.addWidget(self.open_btn)
 
         self.export_btn = QPushButton("⬇  Export PCAP")
         self.export_btn.setToolTip("Save captured packets to a Wireshark-compatible .pcap file")
@@ -407,7 +426,103 @@ class CapturePage(QWidget):
         self.filter_timer.start()
 
     def _apply_display_filter_now(self):
-        self.proxy.set_filter_text(self.display_filter.text())
+        text = self.display_filter.text()
+        self.proxy.set_filter_text(text)
+        # Show parse status as a coloured outline on the field — green for an
+        # accepted expression, amber for a fallback substring search, red if
+        # the expression looked like a filter but failed to parse.
+        mode = self.proxy.filter_mode()
+        if mode == "expr":
+            border = ACCENT
+        elif mode == "substring" and self.proxy.filter_error() is not None:
+            border = "#F87171"
+        elif mode == "substring":
+            border = "#FBBF24"
+        else:
+            border = BORDER
+        self.display_filter.setStyleSheet(
+            f"QLineEdit {{ border: 1px solid {border}; border-radius: 4px; "
+            f"padding: 4px 8px; }}"
+        )
+        if mode == "substring" and self.proxy.filter_error():
+            self.display_filter.setToolTip(
+                f"Parse error: {self.proxy.filter_error()}\n\n"
+                "Falling back to substring search across columns."
+            )
+        # Reset filter status indicator
+        if mode == "all":
+            self.display_filter.setToolTip(
+                "Wireshark-style display filter.  Examples:\n"
+                "  tcp.port == 443\n"
+                "  ip.addr == 192.168.1.0/24\n"
+                "  dns.qry.name contains \"google\"\n"
+                "  tls.handshake.type == 1\n"
+                "  http.response.code >= 400"
+            )
+
+    def _on_open_pcap(self):
+        """Read a Wireshark .pcap or .pcapng file and replay packets through
+        the same dissector pipeline used for live capture."""
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open PCAP / PCAPNG",
+            "",
+            "Capture files (*.pcap *.pcapng *.cap);;All files (*)",
+        )
+        if not path:
+            return
+        # Stop any in-flight live capture so the row numbers don't collide
+        # with what we're about to load.
+        try:
+            if self.engine.is_running():
+                self.engine.stop()
+                self.start_btn.setEnabled(True)
+                self.stop_btn.setEnabled(False)
+        except Exception:
+            pass
+        try:
+            from scapy.all import rdpcap
+            from netscope.dissect import summarize
+            packets = rdpcap(path)
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Open failed",
+                f"Could not read capture file:\n\n{exc}\n\n"
+                "Make sure the file is a valid pcap or pcapng."
+            )
+            return
+
+        self.model.clear()
+        self.detail_tree.clear()
+        self.hex_view.clear()
+        self.strings_view.clear()
+
+        first_ts = float(packets[0].time) if len(packets) > 0 else 0.0
+        items = []
+        for i, pkt in enumerate(packets, start=1):
+            try:
+                rel = float(pkt.time) - first_ts
+            except Exception:
+                rel = 0.0
+            try:
+                row = summarize(pkt, i, rel)
+                raw = bytes(pkt)
+            except Exception:
+                continue
+            items.append((row, raw))
+        if items:
+            self.model.append_packets(items)
+
+        # Repurpose the toolbar to reflect a loaded file rather than a live iface.
+        import os as _os
+        self.iface_label.setText(_os.path.basename(path))
+        self.bpf_label.setText(f"  loaded: {len(items):,} of {len(packets):,} packets")
+        self.band_badge.hide()
+        self.status_label.setText(f"Loaded {len(items):,} packets from {path}")
+        self.status_label.setStyleSheet(f"color: {ACCENT}; font-size: 11px; font-weight: 600;")
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(False)
+        self.drain_timer.stop()
 
     def _on_row_selected(self, current: QModelIndex, _previous: QModelIndex):
         if not current.isValid():
@@ -713,13 +828,28 @@ class MainWindow(QMainWindow):
             pass
 
     def closeEvent(self, event):
-        try:
-            self.engine.stop()
-            self.welcome.stop_monitoring()
-            self.wireless.stop_monitoring()
-            self.rules_page.stop_monitoring()
-            self.pentest_page.stop_all()
-            self.capture_page.deactivate()
-        except Exception:
-            pass
+        # Tear down in a defined order so no QTimer fires after its widget
+        # has started being destroyed (the source of the
+        # "wrapped C/C++ object has been deleted" RuntimeError on Alt+F4).
+        # Each step is isolated so a failure in one can't strand later ones.
+        for step in (
+            ("rule observer detach",  lambda: self.engine.set_observer(None)),
+            ("capture stop",          lambda: self.engine.stop()),
+            ("capture page deactive", lambda: self.capture_page.deactivate()),
+            ("welcome stop",          lambda: self.welcome.stop_monitoring()),
+            ("wireless stop",         lambda: self.wireless.stop_monitoring()),
+            ("rules page stop",       lambda: self.rules_page.stop_monitoring()),
+            ("pentest stop",          lambda: self.pentest_page.stop_all()),
+            ("notifications clear",   lambda: self.notifications.clear()
+             if hasattr(self.notifications, "clear") else None),
+        ):
+            label, fn = step
+            try:
+                fn()
+            except Exception as exc:
+                # Don't let cleanup failures block window close.
+                import logging
+                logging.getLogger(__name__).debug(
+                    "closeEvent: %s failed: %s", label, exc
+                )
         event.accept()

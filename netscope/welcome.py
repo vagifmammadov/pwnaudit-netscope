@@ -116,11 +116,16 @@ class TrafficMonitor(QObject):
     def start(self) -> None:
         self._last_counters = None
         self._last_time = None
+        self._active = True
         self._poll()
         self._timer.start()
 
     def stop(self) -> None:
+        self._active = False
         self._timer.stop()
+
+    def is_active(self) -> bool:
+        return getattr(self, "_active", False)
 
     def _poll(self) -> None:
         try:
@@ -393,8 +398,19 @@ class WelcomePage(QWidget):
         self.interface_chosen.emit(psutil_name, scapy_name, bpf)
 
     def _on_rates(self, rates: dict):
-        for psutil_name, card in self.cards.items():
-            card.update_pps(float(rates.get(psutil_name, 0.0)))
+        # Guard against late signals firing after the page is hidden or while
+        # cards are being rebuilt — both can leave card refs pointing at
+        # widgets Qt is in the middle of destroying.
+        if not self.monitor.is_active():
+            return
+        for psutil_name, card in list(self.cards.items()):
+            try:
+                card.update_pps(float(rates.get(psutil_name, 0.0)))
+            except RuntimeError:
+                # "wrapped C/C++ object has been deleted" — card was torn
+                # down between the timer fire and this slot.  Drop the ref
+                # so we don't keep poking at it.
+                self.cards.pop(psutil_name, None)
 
     def start_monitoring(self):
         for card in self.cards.values():

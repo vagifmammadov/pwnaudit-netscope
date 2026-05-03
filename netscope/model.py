@@ -8,6 +8,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import QFont
 
+from netscope.dfilter import DisplayFilter, validate as validate_dfilter
 from netscope.theme import PROTOCOL_COLORS
 
 COLUMNS = ["#", "Time", "Source", "Destination", "Protocol", "Length", "Info"]
@@ -108,28 +109,48 @@ class PacketTableModel(QAbstractTableModel):
 
 
 class DisplayFilterProxy(QSortFilterProxyModel):
-    """Substring filter applied across all columns."""
+    """Wireshark-grade display filter, with substring fallback.
+
+    Pass an expression like ``tcp.port == 443 && http.host contains "google"``
+    or just type a word — if the expression doesn't parse, we fall back to a
+    case-insensitive substring search across the visible text columns so the
+    casual workflow still works.
+    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._needle = ""
+        self._filter: DisplayFilter = DisplayFilter("")
+        self._raw_text: str = ""
 
     def set_filter_text(self, text: str) -> None:
-        new_needle = (text or "").strip().lower()
-        if new_needle == self._needle:
+        new_text = (text or "").strip()
+        if new_text == self._raw_text:
             return
-        self._needle = new_needle
+        self._raw_text = new_text
+        self._filter = DisplayFilter(new_text)
         self.invalidateFilter()
 
+    def filter_mode(self) -> str:
+        """``'all' | 'expr' | 'substring'`` — for status-bar feedback."""
+        return self._filter.mode
+
+    def filter_error(self) -> Optional[str]:
+        return self._filter.error
+
+    @staticmethod
+    def validate(expression: str) -> Optional[str]:
+        return validate_dfilter(expression)
+
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
-        if not self._needle:
+        if self._filter.mode == "all":
             return True
         model = self.sourceModel()
         if model is None:
             return True
-        for col in range(model.columnCount()):
-            idx = model.index(source_row, col, source_parent)
-            val = model.data(idx, Qt.ItemDataRole.DisplayRole)
-            if val and self._needle in str(val).lower():
-                return True
-        return False
+        if not isinstance(model, PacketTableModel):
+            return True
+        rec = model.get_summary(source_row)
+        if rec is None:
+            return True
+        fields = rec.get("fields") or {}
+        return self._filter.matches(fields, rec)

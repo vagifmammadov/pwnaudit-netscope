@@ -28,10 +28,33 @@ def _relaunch_as_admin() -> int:
 
 
 def _has_npcap() -> bool:
-    """Detect Npcap or WinPcap by looking for the libraries / drivers they install."""
+    """Detect Npcap or WinPcap.
+
+    The authoritative test is "can we actually load wpcap.dll" — file-existence
+    checks miss two real cases:
+      1. 32-bit Python on 64-bit Windows sees System32 redirected to SysWOW64,
+         so the file is at a path the literal-string check doesn't list.
+      2. The user installed Npcap then disabled the service; the file exists
+         but won't load.
+    We try ctypes.WinDLL first and only fall back to file probing if the
+    ctypes import is broken (shouldn't happen on Windows but defensive).
+    """
+    try:
+        ctypes.WinDLL("wpcap.dll")
+        return True
+    except OSError:
+        pass
+    except Exception:
+        pass
+
+    # Fallback: probe known install paths. On 64-bit Windows we explicitly
+    # look in both System32 and SysWOW64 plus the Npcap subdirectory the
+    # installer creates regardless of bitness.
     candidates = [
         r"C:\Windows\System32\Npcap\wpcap.dll",
         r"C:\Windows\System32\Npcap\packet.dll",
+        r"C:\Windows\SysWOW64\Npcap\wpcap.dll",
+        r"C:\Windows\SysWOW64\Npcap\packet.dll",
         r"C:\Windows\System32\wpcap.dll",
         r"C:\Windows\SysWOW64\wpcap.dll",
         r"C:\Windows\System32\drivers\npcap.sys",
